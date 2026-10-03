@@ -15,6 +15,11 @@ interface Component {
   total: number;
   dropGroup?: string;
 }
+interface GradeCutoff {
+  label: string;
+  min: number;
+  gpa: number;
+}
 interface Course {
   id: string;
   code: string;
@@ -24,6 +29,8 @@ interface Course {
   dropLowest: boolean;
   penaltyNote?: string;
   components: Component[];
+  gradeScale?: GradeCutoff[];
+  gpaMax?: number;
   parsedFromSyllabus?: boolean;
 }
 
@@ -79,30 +86,44 @@ const INITIAL_COURSES: Course[] = [
 
 /* ─── Grade scale ────────────────────────────────────────────── */
 const GRADES = [
-  { label: "A+", min: 95, gpa: 4.5 },
+  { label: "A+", min: 95, gpa: 4.0 },
   { label: "A",  min: 90, gpa: 4.0 },
   { label: "A-", min: 87, gpa: 3.7 },
-  { label: "B+", min: 83, gpa: 3.5 },
+  { label: "B+", min: 83, gpa: 3.3 },
   { label: "B",  min: 80, gpa: 3.0 },
   { label: "B-", min: 77, gpa: 2.7 },
-  { label: "C+", min: 73, gpa: 2.5 },
+  { label: "C+", min: 73, gpa: 2.3 },
   { label: "C",  min: 70, gpa: 2.0 },
+  { label: "C-", min: 67, gpa: 1.7 },
   { label: "D",  min: 60, gpa: 1.0 },
   { label: "F",  min: 0,  gpa: 0.0 },
 ];
+const DEFAULT_TARGET_GRADES = ["A", "A-", "B", "B-", "C", "C-"];
 
 const GRADE_COLORS: Record<string, string> = {
   "A+": "#0a7c43", "A": "#15803d", "A-": "#16a34a",
   "B+": "#1d4ed8", "B": "#2563eb", "B-": "#3b82f6",
-  "C+": "#b45309", "C": "#d97706",
+  "C+": "#b45309", "C": "#d97706", "C-": "#e08a1e",
   "D": "#dc2626",  "F": "#991b1b",
 };
 
-const BAR_COLORS = ["#e05a3a", "#3b82f6", "#22c55e", "#a855f7", "#f59e0b"];
-const ACCENT = "#e05a3a";
+const BAR_COLORS = ["#cf3f4c", "#3b82f6", "#22b87a", "#a855f7", "#f59e0b"];
+const ACCENT = "#cf3f4c";
 
-function gradeFor(pct: number) {
-  return GRADES.find((g) => pct >= g.min) ?? GRADES[GRADES.length - 1];
+function gradesForCourse(course: Course): GradeCutoff[] {
+  return course.gradeScale?.length ? course.gradeScale : GRADES;
+}
+
+function targetGradesForCourse(course: Course): string[] {
+  if (!course.gradeScale?.length) return DEFAULT_TARGET_GRADES;
+  const targets = course.gradeScale
+    .filter((grade) => /^[ABC](?:[+-])?$/.test(grade.label))
+    .map((grade) => grade.label);
+  return targets.length ? targets : DEFAULT_TARGET_GRADES;
+}
+
+function gradeFor(pct: number, scale: GradeCutoff[] = GRADES) {
+  return scale.find((g) => pct >= g.min) ?? scale[scale.length - 1];
 }
 
 /* ─── Drop-lowest ────────────────────────────────────────────── */
@@ -128,13 +149,23 @@ function applyDropLowest(course: Course, scores: Record<string, number>): Record
   return result;
 }
 
+function scoreForComponent(
+  component: Component,
+  inputs: Record<string, string>
+): number | undefined {
+  if (Object.prototype.hasOwnProperty.call(inputs, component.id)) {
+    const value = parseFloat(inputs[component.id]);
+    return isNaN(value) ? undefined : value;
+  }
+  return component.earned ?? undefined;
+}
+
 /* ─── Core math ──────────────────────────────────────────────── */
 function buildScores(course: Course, inputs: Record<string, string>): Record<string, number> {
   const raw: Record<string, number> = {};
   for (const c of course.components) {
-    if (c.earned !== null) { raw[c.id] = c.earned; continue; }
-    const v = parseFloat(inputs[c.id] ?? "");
-    if (!isNaN(v)) raw[c.id] = v;
+    const score = scoreForComponent(c, inputs);
+    if (score !== undefined) raw[c.id] = score;
   }
   return applyDropLowest(course, raw);
 }
@@ -162,14 +193,11 @@ function requiredOn(
   const unsetPending: Component[] = [];
   for (const c of course.components) {
     if (c.id === compId) { targetW = c.weight; continue; }
-    if (c.earned !== null) {
-      fixed += (c.earned / c.total) * 100 * c.weight;
+    const score = scoreForComponent(c, inputs);
+    if (score !== undefined) {
+      fixed += (score / c.total) * 100 * c.weight;
       fixedW += c.weight;
-    } else {
-      const v = parseFloat(inputs[c.id] ?? "");
-      if (!isNaN(v)) { fixed += (v / c.total) * 100 * c.weight; fixedW += c.weight; }
-      else unsetPending.push(c);
-    }
+    } else unsetPending.push(c);
   }
   for (const c of unsetPending) {
     fixed += (assumeOtherPending / c.total) * 100 * c.weight;
@@ -177,6 +205,37 @@ function requiredOn(
   }
   if (targetW === 0) return NaN;
   return (targetPct * (fixedW + targetW) - fixed) / targetW;
+}
+
+function requiredAcrossPending(
+  course: Course,
+  targetPct: number,
+  inputs: Record<string, string>
+): number {
+  const pending = course.components.filter(
+    (component) => scoreForComponent(component, inputs) === undefined
+  );
+  if (pending.length === 0) return NaN;
+
+  const projectedAt = (scorePct: number) => {
+    const simulatedInputs = { ...inputs };
+    for (const component of pending) {
+      simulatedInputs[component.id] = String((scorePct / 100) * component.total);
+    }
+    return computeProjected(course, simulatedInputs) ?? 0;
+  };
+
+  if (projectedAt(0) >= targetPct) return 0;
+  if (projectedAt(100) < targetPct) return 101;
+
+  let low = 0;
+  let high = 100;
+  for (let i = 0; i < 32; i++) {
+    const midpoint = (low + high) / 2;
+    if (projectedAt(midpoint) >= targetPct) high = midpoint;
+    else low = midpoint;
+  }
+  return high;
 }
 
 function safetyRange(course: Course, inputs: Record<string, string>) {
@@ -226,17 +285,43 @@ async function parseSyllabus(text: string, apiKey: string): Promise<Partial<Cour
       messages: [{
         role: "user",
         content: `Extract grading from this syllabus. Return ONLY valid JSON:
-{"code":"CS 101","name":"course name","professor":"Prof. Name","credits":3,"dropLowest":false,"penaltyNote":null,"components":[{"id":"uid","name":"Component Name","weight":20,"total":100}]}
-Weights must sum to 100. Syllabus:\n${text.slice(0, 6000)}`,
+{"code":"CS 101","name":"course name","professor":"Prof. Name","credits":3,"dropLowest":false,"penaltyNote":null,"components":[{"id":"uid","name":"Component Name","weight":20,"total":100}],"gradeScale":[{"label":"A+","min":97,"gpa":4.0},{"label":"A","min":93,"gpa":4.0},{"label":"A-","min":90,"gpa":3.7}],"gpaMax":4.0}
+Weights must sum to 100. Extract the exact custom letter-grade scale and percentage cutoffs stated in the syllabus. Include plus/minus grades only when explicitly present and sort from highest to lowest. Also extract GPA points per letter and gpaMax only when the syllabus explicitly states them. Return gradeScale as null when no exact cutoffs are stated and gpaMax as null when it is not stated. Syllabus:\n${text.slice(0, 6000)}`,
       }],
     }),
   });
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error((e as any)?.error?.message ?? `API ${res.status}`); }
   const data = await res.json();
   const parsed = JSON.parse(data.content[0].text.replace(/```json|```/g, "").trim());
+  const gradeScale = Array.isArray(parsed.gradeScale)
+    ? parsed.gradeScale
+        .filter((grade: any) => typeof grade?.label === "string" && Number.isFinite(Number(grade?.min)))
+        .map((grade: any) => {
+          const label = grade.label.trim().toUpperCase();
+          return {
+            label,
+            min: Number(grade.min),
+            gpa: Number.isFinite(Number(grade.gpa))
+              ? Number(grade.gpa)
+              : GRADES.find((item) => item.label === label)?.gpa ?? 0,
+          };
+        })
+        .sort((a: GradeCutoff, b: GradeCutoff) => b.min - a.min)
+    : undefined;
+  if (gradeScale?.length && !gradeScale.some((grade: GradeCutoff) => grade.label === "F")) {
+    gradeScale.push({ label: "F", min: 0, gpa: 0 });
+  }
+  const explicitGpaMax = Number.isFinite(Number(parsed.gpaMax)) && Number(parsed.gpaMax) > 0
+    ? Number(parsed.gpaMax)
+    : undefined;
+  const inferredGpaMax = gradeScale?.length
+    ? Math.max(...gradeScale.map((grade: GradeCutoff) => grade.gpa))
+    : undefined;
   return {
     ...parsed,
     components: parsed.components.map((c: any) => ({ ...c, earned: null, total: c.total ?? 100 })),
+    gradeScale: gradeScale?.length ? gradeScale : undefined,
+    gpaMax: explicitGpaMax ?? inferredGpaMax,
   };
 }
 
@@ -255,37 +340,47 @@ function FileIcon({ size = 36, color = ACCENT }: { size?: number; color?: string
 export default function App() {
   const [courses, setCourses] = useState<Course[]>(INITIAL_COURSES);
   const [selectedId, setSelectedId] = useState("c1");
-  const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [inputsByCourse, setInputsByCourse] = useState<Record<string, Record<string, string>>>({});
   const [target, setTarget] = useState("A");
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem("gp_key") ?? "");
+  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem("gp_key") ?? "");
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadStatus, setUploadStatus] = useState<"idle" | "working" | "done" | "error">("idle");
   const [uploadError, setUploadError] = useState("");
   const [showApiInput, setShowApiInput] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [showWelcome, setShowWelcome] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const course = courses.find((c) => c.id === selectedId)!;
+  const courseGrades = gradesForCourse(course);
+  const inputs = inputsByCourse[selectedId] ?? {};
   const remaining = course.components.filter(
-    (c) => c.earned === null && isNaN(parseFloat(inputs[c.id] ?? ""))
+    (component) => scoreForComponent(component, inputs) === undefined
   );
-  const setInput = (id: string, val: string) => setInputs((p) => ({ ...p, [id]: val }));
+  const setInput = (id: string, val: string) => {
+    setInputsByCourse((previous) => ({
+      ...previous,
+      [selectedId]: {
+        ...(previous[selectedId] ?? {}),
+        [id]: val,
+      },
+    }));
+  };
 
   const projected = computeProjected(course, inputs);
-  const projGrade = projected !== null ? gradeFor(projected) : null;
-  const targetMin = GRADES.find((g) => g.label === target)?.min ?? 90;
+  const projGrade = projected !== null ? gradeFor(projected, courseGrades) : null;
+  const targetMin = courseGrades.find((g) => g.label === target)?.min ?? courseGrades[0]?.min ?? 90;
   const { minPct, maxPct } = safetyRange(course, inputs);
   const targetSecured = minPct >= targetMin;
   const targetImpossible = maxPct < targetMin;
 
-  const primaryComp = remaining.length > 0
-    ? remaining.reduce((a, b) => (a.weight > b.weight ? a : b))
-    : null;
-  const primaryNeeded = primaryComp
-    ? requiredOn(course, targetMin, primaryComp.id, inputs, 100)
-    : null;
+  const sharedNeeded = requiredAcrossPending(course, targetMin, inputs);
+  const targetRequirements = remaining.map((component) => ({
+    component,
+    needed: sharedNeeded,
+  }));
 
-  const nextTarget = GRADES[GRADES.findIndex((g) => g.label === target) + 1];
+  const nextTarget = courseGrades[courseGrades.findIndex((g) => g.label === target) + 1];
   const diagType: "secured" | "impossible" | "inplay" = targetSecured ? "secured" : targetImpossible ? "impossible" : "inplay";
 
   const diagContent = {
@@ -297,7 +392,7 @@ export default function App() {
     impossible: {
       badge: "Not Achievable",
       badgeBg: "#fee2e2", badgeColor: "#dc2626",
-      note: `Even perfect scores max out at ${maxPct.toFixed(1)}% (${gradeFor(maxPct).label}). ${nextTarget ? `Redirect to ${nextTarget.label} — it's within reach.` : ""}`,
+      note: `Even perfect scores max out at ${maxPct.toFixed(1)}% (${gradeFor(maxPct, courseGrades).label}). ${nextTarget ? `Redirect to ${nextTarget.label} — it's within reach.` : ""}`,
     },
     inplay: {
       badge: "Goal Achievable",
@@ -308,13 +403,22 @@ export default function App() {
 
   // GPA
   const gpaItems = courses.map((c, i) => {
-    const pg = computeProjected(c, c.id === selectedId ? inputs : {});
-    const { maxPct: mx } = safetyRange(c, c.id === selectedId ? inputs : {});
-    const g = pg !== null ? gradeFor(pg) : gradeFor(mx);
-    return { course: c, grade: g, pct: pg ?? mx, color: BAR_COLORS[i % BAR_COLORS.length] };
+    const courseInputs = inputsByCourse[c.id] ?? {};
+    const pg = computeProjected(c, courseInputs);
+    const { maxPct: mx } = safetyRange(c, courseInputs);
+    const scale = gradesForCourse(c);
+    const g = pg !== null ? gradeFor(pg, scale) : gradeFor(mx, scale);
+    return {
+      course: c,
+      grade: g,
+      pct: pg ?? mx,
+      color: BAR_COLORS[i % BAR_COLORS.length],
+      gpaMax: c.gpaMax ?? 4,
+    };
   });
   const totalCredits = courses.reduce((s, c) => s + c.credits, 0);
   const semGpa = gpaItems.reduce((s, { course: c, grade: g }) => s + g.gpa * c.credits, 0) / totalCredits;
+  const semGpaMax = gpaItems.reduce((s, { course: c, gpaMax }) => s + gpaMax * c.credits, 0) / totalCredits;
 
   const handleFile = (f: File) => {
     if (f.type !== "application/pdf") { setUploadError("PDF files only."); return; }
@@ -324,7 +428,7 @@ export default function App() {
   const handleParse = async () => {
     if (!uploadFile) { setUploadError("Select a PDF first."); return; }
     if (!apiKey.trim()) { setShowApiInput(true); setUploadError("Enter your Anthropic API key."); return; }
-    localStorage.setItem("gp_key", apiKey.trim());
+    sessionStorage.setItem("gp_key", apiKey.trim());
     setUploadStatus("working"); setUploadError("");
     try {
       const text = await extractPdfText(uploadFile);
@@ -334,55 +438,200 @@ export default function App() {
         components: (data.components?.length ?? 0) > 0 ? data.components! : c.components,
         parsedFromSyllabus: true,
       }));
-      setInputs({});
+      setInputsByCourse((previous) => ({ ...previous, [selectedId]: {} }));
+      const parsedTargets = data.gradeScale
+        ?.filter((grade) => /^[ABC](?:[+-])?$/.test(grade.label))
+        .map((grade) => grade.label) ?? [];
+      if (parsedTargets.length && !parsedTargets.includes(target)) {
+        setTarget(parsedTargets.find((grade) => grade === "A") ?? parsedTargets[0]);
+      }
       setUploadStatus("done");
+      setShowWelcome(false);
     } catch (e: any) { setUploadError(e.message); setUploadStatus("error"); }
   };
 
-  const cutoffGrades = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C"];
-  const targetButtons = ["A+", "A", "A-", "B+", "B", "B-"];
+  const cutoffGrades = courseGrades
+    .filter((grade) => /^[ABC](?:[+-])?$/.test(grade.label))
+    .map((grade) => grade.label);
+  const targetButtons = targetGradesForCourse(course);
 
   // Drop check helper
   const droppedIds = (() => {
     const allRaw: Record<string, number> = {};
     for (const c of course.components) {
-      if (c.earned !== null) allRaw[c.id] = c.earned;
-      else { const v = parseFloat(inputs[c.id] ?? ""); if (!isNaN(v)) allRaw[c.id] = v; }
+      const score = scoreForComponent(c, inputs);
+      if (score !== undefined) allRaw[c.id] = score;
     }
     const kept = applyDropLowest(course, allRaw);
     return new Set(Object.keys(allRaw).filter((id) => !(id in kept)));
   })();
 
+  if (showWelcome) {
+    return (
+      <div className="welcome-shell">
+        <div className="welcome-topbar">
+          <div className="welcome-brand">
+            <div className="gradepilot-mark welcome-mark">GP</div>
+            <div>
+              <div className="welcome-brand-name">GradePilot Engine</div>
+              <div className="welcome-brand-note">AI-powered grade strategy</div>
+            </div>
+          </div>
+          <div className="welcome-step">SETUP · 01</div>
+        </div>
+
+        <main className="welcome-main">
+          <section className="welcome-copy">
+            <div className="welcome-eyebrow">START YOUR GRADE PLAN</div>
+            <div className="welcome-title">Start with your syllabus.</div>
+            <div className="welcome-description">
+              Upload one course syllabus and GradePilot will build the grading model for you.
+              No manual setup, formulas, or cutoff hunting.
+            </div>
+
+            <div className="welcome-benefits">
+              <div className="welcome-benefit">
+                <div className="welcome-benefit-number">01</div>
+                <div>
+                  <div className="welcome-benefit-title">Extract course rules</div>
+                  <div className="welcome-benefit-copy">Weights, drop policies, penalties, and grading cutoffs.</div>
+                </div>
+              </div>
+              <div className="welcome-benefit">
+                <div className="welcome-benefit-number">02</div>
+                <div>
+                  <div className="welcome-benefit-title">Add completed scores</div>
+                  <div className="welcome-benefit-copy">Enter what you have earned and leave upcoming work blank.</div>
+                </div>
+              </div>
+              <div className="welcome-benefit">
+                <div className="welcome-benefit-number">03</div>
+                <div>
+                  <div className="welcome-benefit-title">Choose a target grade</div>
+                  <div className="welcome-benefit-copy">See the minimum score needed across remaining work.</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section className="welcome-upload-card">
+            <div className="welcome-upload-heading">
+              <div className="welcome-upload-icon"><FileIcon size={22} /></div>
+              <div>
+                <div className="welcome-upload-title">Upload your first syllabus</div>
+                <div className="welcome-upload-subtitle">PDF format · up to 8 pages analyzed</div>
+              </div>
+            </div>
+
+            {showApiInput && (
+              <div className="welcome-api-block">
+                <input
+                  className="welcome-api-input"
+                  type="password"
+                  placeholder="Anthropic API key  sk-ant-..."
+                  value={apiKey}
+                  onChange={(event) => setApiKey(event.target.value)}
+                />
+                <div className="welcome-api-note">Required for this prototype and kept only for this browser session.</div>
+              </div>
+            )}
+
+            <div
+              className={`welcome-dropzone${dragging ? " is-dragging" : ""}${uploadFile ? " has-file" : ""}`}
+              onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={(event) => {
+                event.preventDefault();
+                setDragging(false);
+                const file = event.dataTransfer.files[0];
+                if (file) handleFile(file);
+              }}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf"
+                style={{ display: "none" }}
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) handleFile(file);
+                }}
+              />
+              <div className="welcome-drop-icon"><FileIcon size={30} color={uploadFile ? "#15803d" : ACCENT} /></div>
+              <div className="welcome-drop-title">
+                {uploadFile ? uploadFile.name : "Drop your syllabus PDF here"}
+              </div>
+              <div className="welcome-drop-note">
+                {uploadFile ? "Ready for AI analysis" : "or click to browse from your computer"}
+              </div>
+            </div>
+
+            {uploadError && <div className="welcome-message is-error">{uploadError}</div>}
+            {uploadStatus === "done" && <div className="welcome-message is-success">Syllabus analyzed successfully.</div>}
+
+            <div className="welcome-actions">
+              <button
+                className="welcome-primary-action"
+                onClick={handleParse}
+                disabled={uploadStatus === "working" || !uploadFile}
+              >
+                {uploadStatus === "working" ? "Analyzing syllabus..." : "Analyze syllabus"}
+              </button>
+              <button className="welcome-secondary-action" onClick={() => setShowApiInput((value) => !value)}>
+                {apiKey ? "AI connected" : "Connect AI"}
+              </button>
+            </div>
+
+            <button className="welcome-demo-action" onClick={() => setShowWelcome(false)}>
+              Preview with sample courses
+            </button>
+          </section>
+        </main>
+      </div>
+    );
+  }
+
   return (
-    <div style={{
+    <div className="gradepilot-shell" style={{
       height: "100vh", display: "flex", flexDirection: "column",
-      background: "#ffffff", fontFamily: "Inter, system-ui, sans-serif", color: "#111",
+      background: "#f6f7f8", fontFamily: "Inter, system-ui, sans-serif", color: "#111",
       overflow: "hidden",
     }}>
       {/* ── Top bar ── */}
-      <div style={{
+      <div className="gradepilot-topbar" style={{
         borderBottom: "1px solid #ebebeb", padding: "0 24px",
-        height: 44, display: "flex", alignItems: "center", justifyContent: "space-between",
-        flexShrink: 0, background: "#fff",
+        height: 58, display: "flex", alignItems: "center", justifyContent: "space-between",
+        flexShrink: 0, background: "#f6f7f8",
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 24, height: 24, borderRadius: 6, background: ACCENT, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <span style={{ color: "#fff", fontSize: 9, fontWeight: 900 }}>GP</span>
+          <div className="gradepilot-mark" style={{ width: 32, height: 32, borderRadius: 9, background: ACCENT, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <span style={{ color: "#fff", fontSize: 10, fontWeight: 800 }}>GP</span>
           </div>
-          <span style={{ fontSize: 13, fontWeight: 800, color: "#111", letterSpacing: "-0.03em" }}>GradePilot Engine</span>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 800, color: "#111", letterSpacing: "-0.03em" }}>GradePilot Engine</div>
+            <div style={{ fontSize: 9, color: "#8b919a", marginTop: 1 }}>AI-powered syllabus analysis and grade prediction</div>
+          </div>
         </div>
         {/* Course tabs */}
-        <div style={{ display: "flex", gap: 2 }}>
+        <div className="course-tabs" style={{ display: "flex", gap: 4 }}>
           {courses.map((c) => {
-            const pg = computeProjected(c, c.id === selectedId ? inputs : {});
-            const gi = pg !== null ? gradeFor(pg) : null;
+            const pg = computeProjected(c, inputsByCourse[c.id] ?? {});
+            const gi = pg !== null ? gradeFor(pg, gradesForCourse(c)) : null;
             const active = c.id === selectedId;
             return (
-              <button key={c.id} onClick={() => { setSelectedId(c.id); setInputs({}); }}
+              <button className={`course-tab${active ? " is-active" : ""}`} key={c.id} onClick={() => {
+                const nextTargets = targetGradesForCourse(c);
+                setSelectedId(c.id);
+                if (!nextTargets.includes(target)) {
+                  setTarget(nextTargets.find((grade) => grade === "A") ?? nextTargets[0] ?? "A");
+                }
+              }}
                 style={{
-                  padding: "4px 12px", borderRadius: 16, border: "none",
-                  background: active ? "#111" : "transparent",
-                  color: active ? "#fff" : "#999",
+                  padding: "6px 12px", borderRadius: 8, border: "1px solid",
+                  borderColor: active ? ACCENT : "#e3e5e8",
+                  background: active ? ACCENT : "#fff",
+                  color: active ? "#fff" : "#777d86",
                   fontSize: 11, fontWeight: active ? 600 : 400, cursor: "pointer",
                   display: "flex", alignItems: "center", gap: 5,
                 }}>
@@ -395,27 +644,32 @@ export default function App() {
       </div>
 
       {/* ── Page content ── */}
-      <div style={{ flex: 1, overflow: "hidden", padding: "14px 24px 14px" }}>
+      <div className="gradepilot-content" style={{ flex: 1, overflow: "hidden", padding: "14px 24px 14px" }}>
 
         {/* Two-column grid — fills remaining height */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 14, height: "100%", alignItems: "start" }}>
+        <div className="gradepilot-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 320px", gap: 14, height: "100%", alignItems: "start" }}>
 
           {/* ── Left column ── */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 10, height: "100%", overflow: "hidden" }}>
+          <div className="gradepilot-left" style={{ display: "flex", flexDirection: "column", gap: 10, height: "100%", overflow: "hidden" }}>
 
             {/* Syllabus upload card — compact */}
-            <div style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, overflow: "hidden", flexShrink: 0 }}>
+            <div className="gp-card gp-upload-card" style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, overflow: "hidden", flexShrink: 0 }}>
               <div style={{ padding: "11px 18px", borderBottom: "1px solid #f4f4f4", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div>
                   <div style={{ fontSize: 13, fontWeight: 700, color: "#111" }}>Syllabus Upload</div>
-                  <div style={{ fontSize: 11, color: "#aaa" }}>AI extracts grading weights and hidden rules automatically</div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>AI extracts weights, hidden rules, and exact letter-grade cutoffs</div>
                 </div>
                 {course.parsedFromSyllabus && <span style={{ fontSize: 10, color: ACCENT, fontWeight: 700 }}>✦ AI Parsed</span>}
               </div>
               <div style={{ padding: "10px 18px 12px" }}>
                 {showApiInput && (
-                  <input type="password" placeholder="Anthropic API key  sk-ant-..." value={apiKey} onChange={(e) => setApiKey(e.target.value)}
-                    style={{ width: "100%", padding: "6px 10px", border: "1px solid #e4e4e4", borderRadius: 7, fontSize: 12, fontFamily: "DM Mono, monospace", outline: "none", marginBottom: 8, boxSizing: "border-box" }} />
+                  <div style={{ marginBottom: 8 }}>
+                    <input type="password" placeholder="Anthropic API key  sk-ant-..." value={apiKey} onChange={(e) => setApiKey(e.target.value)}
+                      style={{ width: "100%", padding: "6px 10px", border: "1px solid #e4e4e4", borderRadius: 7, fontSize: 12, fontFamily: "DM Mono, monospace", outline: "none", boxSizing: "border-box" }} />
+                    <div style={{ fontSize: 9, color: "#999", marginTop: 4 }}>
+                      Required for this prototype. Kept only for the current browser session.
+                    </div>
+                  </div>
                 )}
                 {/* Compact drop zone */}
                 <div
@@ -445,19 +699,20 @@ export default function App() {
                   </button>
                   <button onClick={() => setShowApiInput((v) => !v)}
                     style={{ padding: "7px 12px", borderRadius: 8, border: "1px solid #e4e4e4", background: "#fff", color: "#888", fontSize: 11, cursor: "pointer" }}>
-                    API Key
+                    Connect AI
                   </button>
                 </div>
               </div>
             </div>
 
             {/* Assessment table */}
-            <div style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, overflow: "hidden", flexShrink: 0 }}>
+            <div className="gp-card" style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, overflow: "hidden", flexShrink: 0 }}>
               <div style={{ padding: "10px 18px 8px", borderBottom: "1px solid #f4f4f4" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: "#111" }}>{course.code} — {course.name}</div>
                     <div style={{ fontSize: 11, color: "#aaa" }}>{course.professor} · {course.credits} cr</div>
+                    <div className="score-entry-note">Enter completed scores below. Leave upcoming work blank.</div>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     {course.dropLowest && <span style={{ fontSize: 9, color: "#1d4ed8", background: "#eff6ff", padding: "2px 6px", borderRadius: 4, fontWeight: 700 }}>DROP LOWEST</span>}
@@ -480,11 +735,13 @@ export default function App() {
               </div>
 
               {course.components.map((comp, i) => {
-                const isPending = comp.earned === null;
-                const inputVal = inputs[comp.id] ?? "";
-                const num = isPending ? parseFloat(inputVal) : comp.earned!;
-                const pct = isNaN(num) ? null : (num / comp.total) * 100;
-                const gi = pct !== null ? gradeFor(pct) : null;
+                const inputVal = Object.prototype.hasOwnProperty.call(inputs, comp.id)
+                  ? inputs[comp.id]
+                  : comp.earned?.toString() ?? "";
+                const num = parseFloat(inputVal);
+                const isPending = isNaN(num);
+                const pct = isPending ? null : (num / comp.total) * 100;
+                const gi = pct !== null ? gradeFor(pct, courseGrades) : null;
                 const isDropped = droppedIds.has(comp.id);
 
                 return (
@@ -502,26 +759,20 @@ export default function App() {
                     </div>
                     <div style={{ fontFamily: "DM Mono, monospace", fontSize: 11, color: "#888", fontWeight: 600 }}>{comp.weight}%</div>
                     <div>
-                      {isPending ? (
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <input type="number" min={0} max={comp.total} placeholder="—"
-                            value={inputVal} onChange={(e) => setInput(comp.id, e.target.value)}
-                            style={{ width: 54, padding: "4px 7px", border: "1.5px solid #e4e4e4", borderRadius: 6, fontSize: 13, fontFamily: "DM Mono, monospace", fontWeight: 700, outline: "none", color: "#111", textAlign: "center", background: "#fafafa" }}
-                            onFocus={(e) => { e.target.style.borderColor = ACCENT; e.target.style.background = "#fff"; }}
-                            onBlur={(e) => { e.target.style.borderColor = "#e4e4e4"; e.target.style.background = "#fafafa"; }}
-                          />
-                          <span style={{ fontSize: 10, color: "#ccc", fontFamily: "DM Mono, monospace" }}>/{comp.total}</span>
-                        </div>
-                      ) : (
-                        <span style={{ fontFamily: "DM Mono, monospace", fontSize: 12, fontWeight: 700, color: "#111" }}>
-                          {comp.earned}<span style={{ color: "#ccc", fontWeight: 400 }}>/{comp.total}</span>
-                        </span>
-                      )}
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        <input type="number" min={0} max={comp.total} placeholder="—"
+                          value={inputVal} onChange={(e) => setInput(comp.id, e.target.value)}
+                          style={{ width: 54, padding: "4px 7px", border: "1.5px solid #e4e4e4", borderRadius: 6, fontSize: 13, fontFamily: "DM Mono, monospace", fontWeight: 700, outline: "none", color: "#111", textAlign: "center", background: "#fafafa" }}
+                          onFocus={(e) => { e.target.style.borderColor = ACCENT; e.target.style.background = "#fff"; }}
+                          onBlur={(e) => { e.target.style.borderColor = "#e4e4e4"; e.target.style.background = "#fafafa"; }}
+                        />
+                        <span style={{ fontSize: 10, color: "#ccc", fontFamily: "DM Mono, monospace" }}>/{comp.total}</span>
+                      </div>
                     </div>
                     <div>
                       {gi ? (
                         <span style={{ fontFamily: "DM Mono, monospace", fontSize: 11, fontWeight: 800, color: isPending ? "#bbb" : (GRADE_COLORS[gi.label] ?? "#888") }}>{gi.label}</span>
-                      ) : <span style={{ fontSize: 10, color: "#ddd" }}>—</span>}
+                      ) : <span className="pending-score-label">Pending</span>}
                     </div>
                   </div>
                 );
@@ -530,7 +781,7 @@ export default function App() {
 
             {/* Grade cutoff table */}
             {remaining.length > 0 && (
-              <div style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, overflow: "hidden", flex: 1, minHeight: 0 }}>
+              <div className="gp-card" style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, overflow: "hidden", flex: 1, minHeight: 0 }}>
                 <div style={{ padding: "10px 18px 8px", borderBottom: "1px solid #f4f4f4", display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
                   <div style={{ fontSize: 13, fontWeight: 700, color: "#111" }}>All-Grade Cutoff Table</div>
                   <div style={{ fontSize: 10, color: "#bbb" }}>min. score per remaining item</div>
@@ -551,7 +802,7 @@ export default function App() {
                     </thead>
                     <tbody>
                       {cutoffGrades.map((gl) => {
-                        const g = GRADES.find((x) => x.label === gl)!;
+                        const g = courseGrades.find((x) => x.label === gl)!;
                         const neededs = remaining.map((c) => requiredOn(course, g.min, c.id, inputs, 100));
                         const worst = Math.max(...neededs);
                         const allImp = neededs.every((n) => n > 100);
@@ -592,21 +843,23 @@ export default function App() {
           </div>
 
           {/* ── Right column ── */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 10, height: "100%", overflow: "hidden" }}>
+          <div className="gradepilot-right" style={{ display: "flex", flexDirection: "column", gap: 10, height: "100%", overflow: "hidden" }}>
 
             {/* Target grade card */}
-            <div style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, overflow: "hidden", flexShrink: 0 }}>
+            <div className="gp-card target-card" style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, overflow: "hidden", flexShrink: 0 }}>
               <div style={{ padding: "10px 18px 8px", borderBottom: "1px solid #f4f4f4", display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: "#111" }}>Target Grade</div>
-                <div style={{ fontSize: 11, color: "#aaa" }}>{course.code}</div>
+                <div style={{ fontSize: 10, color: course.gradeScale?.length ? ACCENT : "#aaa", fontWeight: course.gradeScale?.length ? 700 : 400 }}>
+                  {course.gradeScale?.length ? `Syllabus scale · ${course.code}` : course.code}
+                </div>
               </div>
               <div style={{ padding: "12px 18px 14px" }}>
                 {/* Grade buttons */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, marginBottom: 12 }}>
+                <div className="target-grade-grid" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 7, marginBottom: 12 }}>
                   {targetButtons.map((g) => {
                     const active = target === g;
                     return (
-                      <button key={g} onClick={() => setTarget(g)}
+                      <button className={`target-grade-button${active ? " is-active" : ""}`} key={g} onClick={() => setTarget(g)}
                         style={{
                           padding: "8px 0", borderRadius: 9,
                           border: `2px solid ${active ? ACCENT : "#e8e8e8"}`,
@@ -622,23 +875,27 @@ export default function App() {
                 </div>
 
                 {/* Score hero */}
-                <div style={{
+                <div className={`score-hero is-${diagType}`} style={{
                   borderRadius: 12, padding: "14px 16px", textAlign: "center",
                   background: diagType === "impossible" ? "#fef6f5" : diagType === "secured" ? "#f3fef6" : "#fef9f7",
                   border: `1.5px solid ${diagType === "impossible" ? "#fecaca" : diagType === "secured" ? "#bbf7d0" : "#f0e0dc"}`,
                 }}>
                   <div style={{ fontSize: 10, color: "#aaa", marginBottom: 6 }}>
-                    {primaryComp ? `Min. needed — ${primaryComp.name}` : "Minimum required score"}
+                    {remaining.length > 1
+                      ? "Minimum needed on each pending assessment"
+                      : remaining.length === 1
+                        ? `Min. needed — ${remaining[0].name}`
+                        : "Minimum required score"}
                   </div>
 
                   {diagType === "secured" ? (
                     <div style={{ fontFamily: "DM Mono, monospace", fontSize: 44, fontWeight: 900, color: "#15803d", lineHeight: 1 }}>✓</div>
                   ) : diagType === "impossible" ? (
                     <div style={{ fontFamily: "DM Mono, monospace", fontSize: 44, fontWeight: 900, color: "#dc2626", lineHeight: 1 }}>✕</div>
-                  ) : primaryNeeded !== null ? (
+                  ) : !isNaN(sharedNeeded) ? (
                     <div style={{ lineHeight: 1 }}>
                       <span style={{ fontFamily: "DM Mono, monospace", fontSize: 50, fontWeight: 900, color: "#111", letterSpacing: "-0.03em" }}>
-                        {Math.ceil(primaryNeeded)}
+                        {Math.ceil(sharedNeeded)}
                       </span>
                       <span style={{ fontFamily: "DM Mono, monospace", fontSize: 15, color: "#888", marginLeft: 2 }}>pts</span>
                     </div>
@@ -660,6 +917,32 @@ export default function App() {
                   </div>
                 </div>
 
+                {targetRequirements.length > 1 && (
+                  <div className="requirement-breakdown">
+                    <div className="requirement-breakdown-heading">
+                      <div>
+                        <div className="requirement-breakdown-title">Shared minimum score</div>
+                        <div className="requirement-breakdown-note">Earn at least this score on every pending assessment.</div>
+                      </div>
+                      <div className="requirement-target">{target} target</div>
+                    </div>
+                    {targetRequirements.map(({ component, needed }) => {
+                      const status = needed > 100 ? "Not possible" : needed <= 0 ? "Any score" : `${Math.ceil(needed)} pts`;
+                      return (
+                        <div className="requirement-row" key={component.id}>
+                          <div>
+                            <div className="requirement-name">{component.name}</div>
+                            <div className="requirement-weight">{component.weight}% of course grade</div>
+                          </div>
+                          <div className={`requirement-score${needed > 100 ? " is-impossible" : needed <= 0 ? " is-secured" : ""}`}>
+                            {status}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
                 {/* Current projected */}
                 {projGrade && projected !== null && (
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 8, padding: "8px 12px", background: "#fafafa", borderRadius: 8, border: "1px solid #f0f0f0" }}>
@@ -673,12 +956,12 @@ export default function App() {
             </div>
 
             {/* Semester GPA card */}
-            <div style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, padding: "12px 18px", flex: 1, minHeight: 0, overflow: "auto" }}>
+            <div className="gp-card gpa-card" style={{ background: "#fff", border: "1px solid #ebebeb", borderRadius: 14, padding: "12px 18px", flex: 1, minHeight: 0, overflow: "auto" }}>
               <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 14 }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: "#111" }}>Estimated Semester GPA</div>
                 <div>
                   <span style={{ fontFamily: "DM Mono, monospace", fontSize: 22, fontWeight: 900, color: "#111", letterSpacing: "-0.02em" }}>{semGpa.toFixed(2)}</span>
-                  <span style={{ fontFamily: "DM Mono, monospace", fontSize: 10, color: "#bbb" }}> / 4.5</span>
+                  <span style={{ fontFamily: "DM Mono, monospace", fontSize: 10, color: "#bbb" }}> / {semGpaMax.toFixed(1)}</span>
                 </div>
               </div>
               {gpaItems.map(({ course: c, grade: g, pct, color }) => (
